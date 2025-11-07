@@ -366,6 +366,9 @@ mod tests {
             "spr/test/".into(),
             false,
             false,
+            false,
+            false,
+            false
         )
     }
 

@@ -187,6 +187,7 @@ impl GitHub {
             .args([
                 "fetch",
                 "--no-write-fetch-head",
+                "--no-tags",
                 &config.remote_name,
                 &format!("{}:{}", head.on_github(), head.local()),
                 &format!("{}:{}", base.on_github(), base.local()),
