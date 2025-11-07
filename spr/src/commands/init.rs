@@ -197,6 +197,11 @@ pub async fn init() -> Result<()> {
         .interact_text()?;
 
     config.set_str("spr.branchPrefix", &branch_prefix)?;
+    config.set_str("spr.requireApproval", "false")?;
+    config.set_str("spr.requireTestPlan", "false")?;
+    config.set_str("spr.addReviewedBy", "false")?;
+    config.set_str("spr.addSprBannerComment", "false")?;
+    config.set_str("spr.addSkipCiComment", "false")?;
 
     Ok(())
 }

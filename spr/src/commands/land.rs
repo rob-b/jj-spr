@@ -73,6 +73,7 @@ pub async fn land(
         tokio::process::Command::new("git")
             .arg("fetch")
             .arg("--no-write-fetch-head")
+            .arg("--no-tags")
             .arg("--")
             .arg(&config.remote_name)
             .arg(config.master_ref.on_github()),
