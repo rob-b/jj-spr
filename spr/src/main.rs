@@ -146,7 +146,7 @@ pub async fn spr() -> Result<()> {
     let require_test_plan = get_config_bool("spr.requireTestPlan", &git_config).unwrap_or(true);
     let add_reviewed_by = get_config_bool("spr.addReviewedBy", &git_config).unwrap_or(false);
     let add_spr_banner_commit =
-        get_config_bool("spr.addSprBannerCommit", &git_config).unwrap_or(true);
+        get_config_bool("spr.addSprBannerComment", &git_config).unwrap_or(true);
     let add_skip_ci_comment = get_config_bool("spr.addSkipCiComment", &git_config).unwrap_or(false);
 
     let config = jj_spr::config::Config::new(
