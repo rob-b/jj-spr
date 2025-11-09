@@ -97,10 +97,6 @@ pub async fn land(
     let current_master = git.lock_and_resolve_reference(config.master_ref.local())?;
 
     let base_is_master = pull_request.base.is_master_branch();
-    println!(
-        "base_is_master {:?} prepared_commit: {:?}",
-        base_is_master, prepared_commit.oid
-    );
     let index = git.lock_and_cherrypick(prepared_commit.oid, current_master)?;
     if index.has_conflicts() {
         return Err(Error::new(formatdoc!(
@@ -125,7 +121,6 @@ pub async fn land(
         let repo = git.lock_repo();
         let current_master = repo.find_commit(current_master)?;
         let pr_head = repo.find_commit(pull_request.head_oid)?;
-        println!("current_master: {:?} pr_head: {:?}", current_master, pr_head);
         repo.merge_commits(&current_master, &pr_head)
     }?;
 
