@@ -5,8 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use indoc::formatdoc;
 use std::{io::Write, process::Stdio, time::Duration};
+
+use indoc::formatdoc;
 
 use crate::{
     error::{Error, Result, ResultExt},
@@ -30,19 +31,35 @@ pub struct LandOptions {
 
 pub async fn land(
     opts: LandOptions,
+    git: &crate::git::Git,
     jj: &crate::jj::Jujutsu,
     gh: &mut crate::github::GitHub,
     config: &crate::config::Config,
 ) -> Result<()> {
-    jj.check_no_uncommitted_changes()?;
-
+    // jj.check_no_uncommitted_changes()?;
     let revision = opts.revision.as_deref().unwrap_or("@");
-    let prepared_commit = jj.get_prepared_commit_for_revision(config, revision)?;
+    let mut prepared_commits =
+        jj.get_prepared_commits_from_to(config, "trunk()", revision, false)?;
+    let based_on_unlanded_commits = prepared_commits.len() > 1;
+    if based_on_unlanded_commits && !opts.cherry_pick {
+        return Err(Error::new(formatdoc!(
+            "Cannot land a commit whose parent is not on {master}. To land \
+             this commit, rebase it so that it is a direct child of {master}.
+             Alternatively, if you used the `--cherry-pick` option with `spr \
+             diff`, then you can pass it to `spr land`, too.",
+            master = &config.master_ref.branch_name(),
+        )));
+    }
+    let prepared_commit = match prepared_commits.last_mut() {
+        Some(c) => c,
+        None => {
+            output("👋", "Branch is empty - nothing to do. Good bye!")?;
+            return Ok(());
+        }
+    };
 
-    // For Jujutsu, we'll determine if this is cherry-pick based on the revision's ancestry
-    // For now, we'll trust the user's --cherry-pick flag
-
-    write_commit_title(&prepared_commit)?;
+    // let prepared_commit = jj.get_prepared_commit_for_revision(config, revision)?;
+    write_commit_title(prepared_commit)?;
 
     let pull_request_number = if let Some(number) = prepared_commit.pull_request_number {
         output("#️⃣ ", &format!("Pull Request #{}", number))?;
@@ -50,16 +67,13 @@ pub async fn land(
     } else {
         return Err(Error::new("This commit does not refer to a Pull Request."));
     };
-
     // Load Pull Request information
     let pull_request = gh.clone().get_pull_request(pull_request_number).await?;
-
     if pull_request.state != PullRequestState::Open {
         return Err(Error::new(formatdoc!(
             "This Pull Request is already closed!",
         )));
     }
-
     if config.require_approval && pull_request.review_status != Some(ReviewStatus::Approved) {
         return Err(Error::new(
             "This Pull Request has not been approved on GitHub.",
@@ -67,40 +81,75 @@ pub async fn land(
     }
 
     output("🛫", "Getting started...")?;
-
+    //
     // Fetch current master from GitHub.
-    run_command(
-        tokio::process::Command::new("git")
-            .arg("fetch")
-            .arg("--no-write-fetch-head")
-            .arg("--no-tags")
-            .arg("--")
-            .arg(&config.remote_name)
-            .arg(config.master_ref.on_github()),
-    )
-    .await
-    .reword("git fetch failed".to_string())?;
+    tokio::process::Command::new("git")
+        .arg("fetch")
+        .arg("--no-write-fetch-head")
+        .arg("--no-tags")
+        .arg("--")
+        .arg(&config.remote_name)
+        .arg(config.master_ref.on_github())
+        .output()
+        .await
+        .reword("git fetch failed".to_string())?;
 
-    // TODO: Implement Jujutsu-native cherry-pick and merge validation
-    // For now, we'll trust GitHub's merge validation and skip local validation
+    let current_master = git.lock_and_resolve_reference(config.master_ref.local())?;
+
     let base_is_master = pull_request.base.is_master_branch();
+    println!(
+        "base_is_master {:?} prepared_commit: {:?}",
+        base_is_master, prepared_commit.oid
+    );
+    let index = git.lock_and_cherrypick(prepared_commit.oid, current_master)?;
+    if index.has_conflicts() {
+        return Err(Error::new(formatdoc!(
+            "This commit cannot be applied on top of the '{master}' branch.
+             Please rebase this commit.{unlanded}",
+            master = &config.master_ref.branch_name(),
+            unlanded = if based_on_unlanded_commits {
+                " You may also have to land commits that this commit depends on first."
+            } else {
+                ""
+            },
+        )));
+    }
 
-    // Skip local cherry-pick validation for Jujutsu workflow
-    // GitHub will validate mergeability during the merge process
-    let merge_matches_cherrypick = true;
+    // This is the tree we are getting from cherrypicking the local commit
+    // on the selected base (master or stacked-on Pull Request).
+    let our_tree_oid = git.lock_and_write_index(index)?;
+
+    // Now let's predict what merging the PR into the master branch would
+    // produce.
+    let merge_index = {
+        let repo = git.lock_repo();
+        let current_master = repo.find_commit(current_master)?;
+        let pr_head = repo.find_commit(pull_request.head_oid)?;
+        println!("current_master: {:?} pr_head: {:?}", current_master, pr_head);
+        repo.merge_commits(&current_master, &pr_head)
+    }?;
+
+    // let merge_has_conflicts = merge_index.has_conflicts();
+
+    let merge_matches_cherrypick = if merge_index.has_conflicts() {
+        false
+    } else {
+        let merge_tree_oid = git.lock_and_write_index(merge_index)?;
+        merge_tree_oid == our_tree_oid
+    };
 
     if !merge_matches_cherrypick {
         return Err(Error::new(formatdoc!(
             "This commit has been updated and/or rebased since the pull \
-             request was last updated. Please run `spr diff` to update the \
-             pull request and then try `spr land` again!"
+             request was last updated. Please run `jj-spr diff` to update the \
+             pull request and then try `jj-spr land` again!"
         )));
     }
 
     // Okay, we are confident now that the PR can be merged and the result of
     // that merge would be a master commit with the same tree as if we
     // cherry-picked the commit onto master.
-    let pr_head_oid = pull_request.head_oid;
+    let mut pr_head_oid = pull_request.head_oid;
 
     if !base_is_master {
         // The base of the Pull Request on GitHub is not set to master. This
@@ -133,12 +182,62 @@ pub async fn land(
         // fact, the tree that we use for the merge commit is the one we got
         // above from the cherry-picking of this commit on master.
 
-        // TODO: Implement Jujutsu-native merge base and tree comparison
-        // For now, skip the complex merge-in-master logic
-        // This logic would need to be rewritten using jj commands
+        // The commit on the base branch that the PR branch is currently based on
+        let pr_base_oid = git.lock_and_get_merge_base(pr_head_oid, pull_request.base_oid)?;
+        let pr_base_tree = git.lock_and_get_tree_oid_for_commit(pr_base_oid)?;
 
-        // Skip the merge-in-master commit creation for Jujutsu workflow
+        let pr_master_base = git.lock_and_get_merge_base(pr_base_oid, current_master)?;
+        let pr_master_base_tree = git.lock_and_get_tree_oid_for_commit(pr_master_base)?;
 
+        gh.update_pull_request(
+            pull_request_number,
+            PullRequestUpdate {
+                base: Some(config.master_ref.branch_name().to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        if pr_base_tree != pr_master_base_tree {
+            // So the current file contents of the base branch are not the same
+            // as those of the master branch commit that the base branch is
+            // based on. In other words, the base branch is currently not
+            // "empty". Or, the base branch has changes in them. These changes
+            // must all have been landed on master in the meantime (after this
+            // base branch was branched off) or otherwise we would have aborted
+            // this whole operation further above. But in order not to show them
+            // as part of this Pull Request after landing, we have to make clear
+            // those are changes in master, not in this Pull Request.
+            // Here comes the additional merge-in-master commit on the Pull
+            // Request branch that achieves that!
+
+            let message = if config.add_spr_banner_comment {
+                format!(
+                    "[spr] landed version\n\nCreated using spr {}",
+                    env!("CARGO_PKG_VERSION")
+                )
+            } else {
+                "landed version".to_string()
+            };
+
+            pr_head_oid = git.lock_and_create_derived_commit(
+                pr_head_oid,
+                &message,
+                our_tree_oid,
+                &[pr_head_oid, current_master],
+            )?;
+
+            let mut cmd = tokio::process::Command::new("git");
+            cmd.arg("push")
+                .arg("--atomic")
+                .arg("--no-verify")
+                .arg("--")
+                .arg(&config.remote_name)
+                .arg(format!("{}:{}", pr_head_oid, pull_request.head.on_github()));
+            run_command(&mut cmd)
+                .await
+                .reword("git push failed".to_string())?;
+        }
         gh.update_pull_request(
             pull_request_number,
             PullRequestUpdate {
@@ -149,9 +248,9 @@ pub async fn land(
         .await?;
     }
 
-    // Check whether GitHub says this PR is mergeable. This happens in a
-    // retry-loop because recent changes to the Pull Request can mean that
-    // GitHub has not finished the mergeability check yet.
+    // // Check whether GitHub says this PR is mergeable. This happens in a
+    // // retry-loop because recent changes to the Pull Request can mean that
+    // // GitHub has not finished the mergeability check yet.
     let mut attempts = 0;
     let result = loop {
         attempts += 1;
@@ -175,9 +274,18 @@ pub async fn land(
                 )));
             }
 
-            // TODO: Implement Jujutsu-native commit fetching and tree comparison
-            // For now, skip the merge commit validation
-            // This would need to be rewritten using jj commands
+            if let Some(merge_commit) = mergeability.merge_commit {
+                git.lock_and_fetch_commits_from_remote(&[merge_commit], &config.remote_name)
+                    .await?;
+
+                if git.lock_and_get_tree_oid_for_commit(merge_commit)? != our_tree_oid {
+                    return Err(Error::new(formatdoc!(
+                        "This commit has been updated and/or rebased since the pull
+                     request was last updated. Please run `spr diff` to update the pull
+                     request and then try `spr land` again!"
+                    )));
+                }
+            };
 
             break Ok(());
         }
@@ -280,7 +388,7 @@ pub async fn land(
         )
     };
 
-    // Rebase us on top of the now-landed commit
+    // // Rebase us on top of the now-landed commit
     if let Some(sha) = merge.sha {
         // Try this up to three times, because fetching the very moment after
         // the merge might still not find the new commit.
@@ -304,8 +412,8 @@ pub async fn land(
                 return Err(Error::new("git fetch failed"));
             }
         }
-        // TODO: Implement Jujutsu-native rebase after landing
-        // For now, the user will need to manually rebase after landing
+
+        // FIXME: put the jj mainline name into configjj
         output(
             "⚠️",
             "Please manually rebase your working copy after landing",

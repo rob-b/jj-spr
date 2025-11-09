@@ -145,9 +145,9 @@ pub async fn spr() -> Result<()> {
     let require_approval = get_config_bool("spr.requireApproval", &git_config).unwrap_or(false);
     let require_test_plan = get_config_bool("spr.requireTestPlan", &git_config).unwrap_or(true);
     let add_reviewed_by = get_config_bool("spr.addReviewedBy", &git_config).unwrap_or(false);
-    let add_spr_banner_commit = get_config_bool("spr.addSprBannerCommit", &git_config).unwrap_or(true);
+    let add_spr_banner_commit =
+        get_config_bool("spr.addSprBannerComment", &git_config).unwrap_or(true);
     let add_skip_ci_comment = get_config_bool("spr.addSkipCiComment", &git_config).unwrap_or(false);
-
 
     let config = jj_spr::config::Config::new(
         github_owner,
@@ -163,6 +163,10 @@ pub async fn spr() -> Result<()> {
     );
 
     let jj = jj_spr::jj::Jujutsu::new(repo)
+        .context("could not initialize Jujutsu backend".to_owned())?;
+
+    let repo_git = git2::Repository::discover(std::env::current_dir()?)?;
+    let git = jj_spr::git::Git::new(repo_git)
         .context("could not initialize Jujutsu backend".to_owned())?;
 
     if let Commands::Format(opts) = cli.command {
@@ -196,7 +200,7 @@ pub async fn spr() -> Result<()> {
 
     match cli.command {
         Commands::Diff(opts) => commands::diff::diff(opts, &jj, &mut gh, &config).await?,
-        Commands::Land(opts) => commands::land::land(opts, &jj, &mut gh, &config).await?,
+        Commands::Land(opts) => commands::land::land(opts, &git, &jj, &mut gh, &config).await?,
         Commands::Amend(opts) => commands::amend::amend(opts, &jj, &mut gh, &config).await?,
         Commands::List => commands::list::list(graphql_client, &config).await?,
         Commands::Patch(opts) => commands::patch::patch(opts, &jj, &mut gh, &config).await?,

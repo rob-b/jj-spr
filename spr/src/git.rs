@@ -15,6 +15,7 @@ use std::{
 use crate::{
     config::Config,
     error::{Error, Result, ResultExt},
+    git,
     github::GitHubBranch,
     message::{MessageSection, MessageSectionsMap, build_commit_message, parse_message},
     utils::run_command,
@@ -22,6 +23,12 @@ use crate::{
 use debug_ignore::DebugIgnore;
 use git2::Oid;
 use git2_ext::ops::UserSign;
+
+fn collect_arr<const N: usize, T>(mut i: impl Iterator<Item = T>) -> [T; N] {
+    let arr = std::array::from_fn(|_| i.next().unwrap());
+    assert!(i.next().is_none());
+    arr
+}
 
 #[derive(Debug)]
 pub struct PreparedCommit {
@@ -79,6 +86,17 @@ impl Git {
         walk.hide_ref(master_ref)?;
 
         Ok(walk.collect::<std::result::Result<Vec<Oid>, _>>()?)
+    }
+
+    pub fn lock_and_find_merge_index(&self, a: Oid, b: Oid) -> Result<git2::Index> {
+        let repo = self.lock_repo();
+        let c1 = repo.find_commit(a)?;
+        let c2 = repo.find_commit(b)?;
+        repo.merge_commits(&c1, &c2)
+    }
+
+    pub fn lock_and_get_merge_base(&self, a: Oid, b: Oid) -> Result<git2::Oid> {
+        self.lock_repo().merge_base(a, b)
     }
 
     pub fn lock_and_get_prepared_commits(&self, config: &Config) -> Result<Vec<PreparedCommit>> {
@@ -258,6 +276,17 @@ impl Git {
         Ok(oid)
     }
 
+    pub fn lock_and_revparse(&self, spec: &str) -> Result<Oid> {
+        let repo = self.lock_repo();
+        let oid = repo
+            .repo
+            .revparse(spec)?
+            .to()
+            .map(|o| o.id())
+            .ok_or_else(|| Error::new("Cannot revparse"))?;
+        Ok(oid)
+    }
+
     pub fn lock_and_resolve_reference(&self, reference: &str) -> Result<Oid> {
         let result = self
             .lock_repo()
@@ -287,6 +316,7 @@ impl Git {
             command
                 .arg("fetch")
                 .arg("--no-write-fetch-head")
+                .arg("--no-tags")
                 .arg("--")
                 .arg(remote);
 
@@ -931,7 +961,7 @@ mod tests {
             false,
             false,
             false,
-            false
+            false,
         )
     }
 
