@@ -10,7 +10,11 @@ use std::{io::Write, process::Stdio, time::Duration};
 use indoc::formatdoc;
 
 use crate::{
-    error::{Error, Result, ResultExt}, github::{PullRequestState, PullRequestUpdate, ReviewStatus}, message::build_github_body_for_merging, output::{output, write_commit_title}, utils::run_command
+    error::{Error, Result, ResultExt},
+    github::{PullRequestState, PullRequestUpdate, ReviewStatus},
+    message::build_github_body_for_merging,
+    output::{output, write_commit_title},
+    utils::run_command,
 };
 
 #[derive(Debug, clap::Parser)]
@@ -90,9 +94,13 @@ pub async fn land(
         .await
         .reword("git fetch failed".to_string())?;
 
-    let current_master = git.lock_and_revparse(config.master_ref.on_github())?;
+    let current_master = git.lock_and_resolve_reference(config.master_ref.local())?;
 
     let base_is_master = pull_request.base.is_master_branch();
+    println!(
+        "base_is_master {:?} prepared_commit: {:?}",
+        base_is_master, prepared_commit.oid
+    );
     let index = git.lock_and_cherrypick(prepared_commit.oid, current_master)?;
     if index.has_conflicts() {
         return Err(Error::new(formatdoc!(
@@ -113,7 +121,15 @@ pub async fn land(
 
     // Now let's predict what merging the PR into the master branch would
     // produce.
-    let merge_index = git.lock_and_find_merge_index(current_master, pull_request.head_oid)?;
+    let merge_index = {
+        let repo = git.lock_repo();
+        let current_master = repo.find_commit(current_master)?;
+        let pr_head = repo.find_commit(pull_request.head_oid)?;
+        println!("current_master: {:?} pr_head: {:?}", current_master, pr_head);
+        repo.merge_commits(&current_master, &pr_head)
+    }?;
+
+    // let merge_has_conflicts = merge_index.has_conflicts();
 
     let merge_matches_cherrypick = if merge_index.has_conflicts() {
         false
@@ -217,11 +233,7 @@ pub async fn land(
                 .arg("--no-verify")
                 .arg("--")
                 .arg(&config.remote_name)
-                .arg(format!(
-                    "{}:{}",
-                    pr_head_oid,
-                    pull_request.head.on_github()
-                ));
+                .arg(format!("{}:{}", pr_head_oid, pull_request.head.on_github()));
             run_command(&mut cmd)
                 .await
                 .reword("git push failed".to_string())?;
@@ -263,20 +275,15 @@ pub async fn land(
             }
 
             if let Some(merge_commit) = mergeability.merge_commit {
-                git.lock_and_fetch_commits_from_remote(
-                    &[merge_commit],
-                    &config.remote_name,
-                )
-                .await?;
+                git.lock_and_fetch_commits_from_remote(&[merge_commit], &config.remote_name)
+                    .await?;
 
-                if git.lock_and_get_tree_oid_for_commit(merge_commit)?
-                    != our_tree_oid
-                {
+                if git.lock_and_get_tree_oid_for_commit(merge_commit)? != our_tree_oid {
                     return Err(Error::new(formatdoc!(
-                    "This commit has been updated and/or rebased since the pull
+                        "This commit has been updated and/or rebased since the pull
                      request was last updated. Please run `spr diff` to update the pull
                      request and then try `spr land` again!"
-                )));
+                    )));
                 }
             };
 
